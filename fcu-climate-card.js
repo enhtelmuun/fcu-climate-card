@@ -1,5 +1,5 @@
 /**
- * FCU Climate Card  v1.3.0
+ * FCU Climate Card  v1.3.1
  * ═══════════════════════════════════════════════════════════════
  * Шинэчлэлт v1.3.0:
  *   - Heat горим: arc ЗҮҮНЭЭС дүүрнэ (knob зүүн=min → баруун=max)
@@ -150,16 +150,21 @@ class FcuClimateCard extends HTMLElement {
       (setTemp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
 
     if (mKey === '2') {
-      // Fan: үргэлж дүүрэн
-      return { arcPath: this._arc(A0, AE), knobAngle: A0, ratio: 1 };
+      // Fan: arc үргэлж дүүрэн цэнхэр.
+      // Knob нь setTemp-ийн байрлалд харагдана (heat чиглэлээр), drag биш.
+      const knobAngle = A0 + ratio * SPAN;
+      return { arcPath: this._arc(A0, AE), knobAngle, ratio: 1 };
     }
     if (mKey === '0') {
-      // Cool: БАРУУНААС (AE=405°) → зүүн тийш
-      const knobAngle = AE - ratio * SPAN;   // ratio=0→AE(баруун), ratio=1→A0(зүүн)
-      const arcPath = ratio > 0.005 ? this._arc(knobAngle, AE) : null;
+      // Cool: ЗҮҮНААС дүүрнэ (A0 → knob).
+      // Knob баруун=min temp, зүүн=max temp.
+      // ratio=0 (temp=min) → knobAngle=AE → full arc, knob баруун ✓
+      // ratio=1 (temp=max) → knobAngle=A0 → no arc, knob зүүн ✓
+      const knobAngle = AE - ratio * SPAN;
+      const arcPath = ratio < 0.995 ? this._arc(A0, knobAngle) : null;
       return { arcPath, knobAngle, ratio };
     }
-    // Heat / default: ЗҮҮНЭЭС (A0=135°) → баруун тийш
+    // Heat: ЗҮҮНААС (A0) → баруун тийш (стандарт)
     const knobAngle = A0 + ratio * SPAN;
     const arcPath = ratio > 0.005 ? this._arc(A0, knobAngle) : null;
     return { arcPath, knobAngle, ratio };
@@ -168,21 +173,15 @@ class FcuClimateCard extends HTMLElement {
   /* ── Хулганы өнцгөөс температур → горимоор чиглэл тооцно ── */
   _angleToTemp(deg, mKey) {
     const cfg = this._config;
-    let ratio;
+    let r;
 
-    if (mKey === '0') {
-      // Cool: баруун=min, зүүн=max
-      if (deg >= 135)     ratio = (AE - deg) / SPAN;   // AE=405
-      else if (deg <= 45) ratio = 0;                    // баруун захад ойр = min
-      else                ratio = deg > 90 ? 1 : 0;    // 45°–135° хөрс: зүүн=max
-    } else {
-      // Heat/Fan: зүүн=min, баруун=max
-      if (deg >= 135)     ratio = (deg - A0) / SPAN;
-      else if (deg <= 45) ratio = (deg + 225) / SPAN;
-      else                ratio = deg < 90 ? 1 : 0;    // 45°–135° хөрс: баруун=max
-    }
+    if (deg >= 135)     r = (deg - A0) / SPAN;
+    else if (deg <= 45) r = (deg + 225) / SPAN;
+    else                r = deg < 90 ? 1 : 0;   // 45°–135° хөрс
+    r = Math.max(0, Math.min(1, r));
 
-    ratio = Math.max(0, Math.min(1, ratio));
+    // Cool: чиглэл урвуу — баруун(r=1)=min temp, зүүн(r=0)=max temp
+    const ratio = mKey === '0' ? 1 - r : r;
     return Math.round(cfg.min_temp + ratio * (cfg.max_temp - cfg.min_temp));
   }
 
@@ -195,7 +194,7 @@ class FcuClimateCard extends HTMLElement {
     const isOn   = this._num(cfg.sensors.power) === 1;
     const mColor = isOn ? (MODES[mKey] ?? MODES['1']).color : '#9E9E9E';
 
-    if (mKey === '2') return; // Fan: дугуй хэзээ ч хөдлөхгүй
+    if (mKey === '2') return; // Fan: дугуй хэзээ ч хөдлөхгүй (arc үргэлж дүүрэн)
 
     const { arcPath, knobAngle } = this._arcForTemp(temp, mKey);
 
@@ -316,8 +315,8 @@ class FcuClimateCard extends HTMLElement {
       ? 'var(--primary-text-color)'
       : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
 
-    /* Fan горим: knob нуух (arc үргэлж дүүрэн) */
-    const showKnob = isOn && mKey !== '2';
+    /* Fan горим: knob харагдана боловч drag биш; arc үргэлж дүүрэн */
+    const showKnob = isOn;               // бүх горимд харагдана
     const arcOpacity = isOn ? 0.95 : 0.25;
 
     this.shadowRoot.innerHTML = `
@@ -356,7 +355,7 @@ class FcuClimateCard extends HTMLElement {
               fill="white" stroke="${mColor}" stroke-width="3.5"
               opacity="${showKnob ? 1 : 0}"
               filter="url(#ksh)"
-              style="cursor:${isOn && mKey !== '2' ? 'grab' : 'default'};touch-action:none"/>
+              style="cursor:${isOn && mKey !== '2' ? 'grab' : 'default'};touch-action:none;pointer-events:${mKey === '2' ? 'none' : 'auto'}"/>
 
             <!-- Горим нэр (sensor-оос) -->
             <text x="150" y="108" text-anchor="middle"
@@ -492,7 +491,11 @@ window.customCards.push({
   preview: true,
 });
 console.info(
-  '%c FCU-CLIMATE-CARD %c v1.3.0 ',
+  '%c FCU-CLIMATE-CARD %c v1.3.1 ',
   'color:#fff;background:#1E88E5;font-weight:bold;padding:2px 4px;border-radius:4px 0 0 4px',
   'color:#1E88E5;background:#E3F2FD;font-weight:bold;padding:2px 4px;border-radius:0 4px 4px 0'
 );
+
+// v1.3.1 patch notes:
+// - Cool arc: _arc(A0, knobAngle) — зүүнаас, knob баруун=min, зүүн=max
+// - Fan mode: knob харагдана (setTemp байрлалд), drag болохгүй, temp солихгүй
