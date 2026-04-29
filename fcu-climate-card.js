@@ -1,119 +1,96 @@
 /**
- * FCU Climate Card  v1.1.0
+ * FCU Climate Card  v1.2.0
  * ═══════════════════════════════════════════════════════════════
- * Modbus sensor-уудыг уншиж, modbus.write_register сервисээр
- * RS485 бичих боломжтой термостат custom card.
- * Climate entity ашиглахгүй — бүх утга sensor-оос ирнэ.
+ * Шинэчлэлт v1.2.0:
+ *   - Arc слайдер (touch/mouse drag) — set temp тохируулна
+ *   - 60 секундын дараа sensor утга руу буцах
+ *   - Fan speed → horizontal range slider (1–5 шат)
+ *   - Алдааны chip болон +/− товч хасагдсан
+ *   - Arc томорсон (r=120, W=28)
+ *   - Температурын тоо голлосон
+ * ═══════════════════════════════════════════════════════════════
  *
  * Dashboard YAML тохиргоо:
  *   type: custom:fcu-climate-card
  *   name: FCU 1
- *   hub: modbus_gateway        # configuration.yaml дахь modbus hub нэр
- *   slave: 2                   # RS485 slave ID
- *   min_temp: 16               # хамгийн бага тохируулга (°C)
- *   max_temp: 30               # хамгийн их тохируулга (°C)
+ *   hub: modbus_gateway
+ *   slave: 2
+ *   min_temp: 16
+ *   max_temp: 30
  *   sensors:
  *     power:        sensor.fcu_1_power_state
  *     mode:         sensor.fcu_1_mode
  *     set_temp:     sensor.fcu_1_set_temperature
- *     ambient_temp: sensor.fcu_1_ambient_temperature   # scale: 0.1 байх ёстой
+ *     ambient_temp: sensor.fcu_1_ambient_temperature
  *     fan_speed:    sensor.fcu_1_fan_speed
- *     fault:        sensor.fcu_1_fault_status          # заавал биш
- *
- * Удирдах боломжтой зүйлс:
- *   − / +        → addr 4  Set temperature
- *   ● ● ○ ○     → addr 2  Fan speed (1·3·4·5 шат)
- *   ⏻ 🌀 ❄ 🔥  → addr 0,1 Power / Mode
- *
- * Register зураглал (RS485 PDF протокол):
- *   addr 0  → Power (0=off, 1=on)          — уншина/бичнэ
- *   addr 1  → Mode  (0=cool,1=heat,2=fan)  — уншина/бичнэ
- *   addr 2  → Fan speed (1–5 шат)          — уншина/бичнэ
- *   addr 4  → Set temperature (°C)         — уншина/бичнэ
- *   addr 20 → Ambient temperature (×0.1°C) — зөвхөн уншина
- *   addr 24 → Fault status (Bit0–Bit6)     — зөвхөн уншина
- * ═══════════════════════════════════════════════════════════════
  */
 
-const MODES = {
-  '0': { label: 'Cool', icon: 'mdi:snowflake', color: '#1E88E5' },
-  '1': { label: 'Heat', icon: 'mdi:fire',      color: '#E53935' },
-  '2': { label: 'Fan',  icon: 'mdi:fan',        color: '#00ACC1' },
-};
+/* ── Arc тогтмол ── */
+const CX = 150, CY = 148, R = 120, W = 28;
+const A0 = 135, SPAN = 270;
+const VW = 300, VH = 290;
 
-/* Fan speed: register утга → харуулах индекс (0–3) */
-const FAN_VALS   = [1, 3, 4, 5];
-const FAN_LABELS = ['Шат 1', 'Шат 3', 'Шат 4', 'Шат 5'];
+const MODES = {
+  '0': { label: 'Cool', color: '#1E88E5' },
+  '1': { label: 'Heat', color: '#E53935' },
+  '2': { label: 'Fan',  color: '#00ACC1' },
+};
 
 const STYLES = `
 :host { display: block; }
 ha-card { overflow: hidden; font-family: var(--primary-font-family, sans-serif); }
 
 /* ── Header ── */
-.header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 16px 0;
-}
+.header { padding: 16px 16px 0; }
 .title { font-size: 16px; font-weight: 500; color: var(--primary-text-color); }
-.fault-chip {
-  font-size: 11px; font-weight: 500;
-  background: #FCEBEB; color: #A32D2D;
-  padding: 2px 9px; border-radius: 99px;
-}
 
 /* ── Body ── */
-.body {
-  display: flex; flex-direction: column; align-items: center;
-  padding: 0 12px 0;
-}
+.body { display: flex; flex-direction: column; align-items: center; padding: 0 12px 0; }
 
-/* ── SVG термостат ── */
-.dial { width: 100%; max-width: 280px; overflow: visible; }
-.dial-mode { font-size: 18px; font-weight: 500; }
-.dial-temp { font-size: 58px; font-weight: 300; fill: var(--primary-text-color); }
-.dial-unit { font-size: 24px; font-weight: 300; fill: var(--primary-text-color); }
-.dial-amb  { font-size: 15px; fill: var(--secondary-text-color); }
-
-/* ── Температур товч ── */
-.controls { display: flex; gap: 32px; margin: -6px 0 8px; }
-.ctrl-btn {
-  width: 46px; height: 46px; border-radius: 50%;
-  border: 1.5px solid var(--divider-color, #e0e0e0);
-  background: transparent; font-size: 28px; line-height: 1;
-  cursor: pointer; color: var(--primary-text-color);
-  display: flex; align-items: center; justify-content: center;
-  transition: background 0.15s; user-select: none;
-  -webkit-tap-highlight-color: transparent;
+/* ── Arc SVG ── */
+.dial {
+  width: 100%; max-width: 300px; overflow: visible;
+  touch-action: none; user-select: none; -webkit-user-select: none;
 }
-.ctrl-btn:active { background: var(--secondary-background-color, #f5f5f5); }
-.ctrl-btn:disabled { opacity: 0.3; cursor: default; }
+.dial-mode { font-size: 17px; font-weight: 500; }
+.dial-temp { font-size: 64px; font-weight: 300; fill: var(--primary-text-color); }
+.dial-unit { font-size: 22px; font-weight: 300; fill: var(--primary-text-color); }
+.dial-amb  { font-size: 14px; fill: var(--secondary-text-color); }
 
-/* ── Fan speed ── */
-.fan-row {
-  display: flex; align-items: center; gap: 0; margin-bottom: 12px;
-  background: var(--secondary-background-color, #f5f5f5);
-  border-radius: 99px; padding: 4px;
+/* ── Fan slider ── */
+.fan-section { width: 100%; padding: 4px 8px 14px; }
+.fan-lbl-row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--secondary-text-color); margin-bottom: 8px;
 }
-.fan-btn {
-  display: flex; align-items: center; justify-content: center;
-  gap: 5px; padding: 6px 14px; border: none; border-radius: 99px;
-  background: transparent; cursor: pointer;
-  font-size: 12px; font-weight: 500;
+.fan-speed-val { font-weight: 600; color: var(--primary-text-color); }
+
+.fan-slider {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 6px; border-radius: 99px;
+  outline: none; cursor: pointer; margin: 0; display: block;
+  transition: background 0.1s;
+}
+.fan-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--fan-clr, #1E88E5);
+  box-shadow: 0 1px 6px rgba(0,0,0,0.28);
+  cursor: grab;
+  transition: transform 0.1s;
+}
+.fan-slider::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.12); }
+.fan-slider::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--fan-clr, #1E88E5); border: none;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.28); cursor: grab;
+}
+.fan-slider:disabled { opacity: 0.35; pointer-events: none; }
+.fan-marks {
+  display: flex; justify-content: space-between;
+  padding: 5px 2px 0; font-size: 10px;
   color: var(--secondary-text-color);
-  transition: background 0.15s, color 0.15s;
-  -webkit-tap-highlight-color: transparent;
-  white-space: nowrap;
 }
-.fan-btn.f-active {
-  background: white;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.15);
-}
-.fan-dot-sm {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--divider-color, #ccc); display: inline-block;
-  transition: background 0.15s;
-}
-.fan-dot-sm.filled { background: currentColor; }
 
 /* ── Горим товч ── */
 .mode-row {
@@ -135,13 +112,14 @@ class FcuClimateCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this._config  = null;
-    this._hass    = null;
-    this._pending = null;   // оновчтой set_temp
-    this._pTimer  = null;
+    this._config   = null;
+    this._hass     = null;
+    this._pending  = null;   // drag-аар оновчтой set_temp
+    this._pTimer   = null;
+    this._dragging = false;
   }
 
-  /* ── Config ──────────────────────────────────────────────── */
+  /* ── Config ── */
   setConfig(cfg) {
     if (!cfg.hub)     throw new Error("'hub' шаардлагатай (modbus hub нэр)");
     if (!cfg.slave)   throw new Error("'slave' шаардлагатай (RS485 slave ID)");
@@ -150,37 +128,83 @@ class FcuClimateCard extends HTMLElement {
     this._render();
   }
 
-  set hass(h) { this._hass = h; this._render(); }
+  set hass(h) {
+    this._hass = h;
+    if (!this._dragging) this._render();
+  }
 
-  /* ── Туслах ──────────────────────────────────────────────── */
+  /* ── Туслах ── */
   _num(id) {
     if (!id || !this._hass) return null;
     const v = parseFloat(this._hass.states[id]?.state);
     return isNaN(v) ? null : v;
   }
 
-  /* modbus.write_register дуудах */
   _write(address, value) {
     this._hass.callService('modbus', 'write_register', {
-      hub:   this._config.hub,
-      slave: this._config.slave,
-      address,
-      value: Math.round(value),
+      hub: this._config.hub, slave: this._config.slave,
+      address, value: Math.round(value),
     });
   }
 
-  /* SVG arc тооцоолол */
-  _pt(cx, cy, r, deg) {
+  /* ── Arc тооцоолол ── */
+  _pt(deg) {
     const a = (deg * Math.PI) / 180;
-    return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
-  }
-  _arc(cx, cy, r, a1, a2) {
-    const s = this._pt(cx, cy, r, a1);
-    const e = this._pt(cx, cy, r, a2);
-    return `M${s.x.toFixed(1)} ${s.y.toFixed(1)} A${r} ${r} 0 ${a2-a1>180?1:0} 1 ${e.x.toFixed(1)} ${e.y.toFixed(1)}`;
+    return { x: CX + R * Math.cos(a), y: CY + R * Math.sin(a) };
   }
 
-  /* ── Үйлдлүүд ────────────────────────────────────────────── */
+  _arc(a1, a2) {
+    const s = this._pt(a1), e = this._pt(a2);
+    const large = (a2 - a1) > 180 ? 1 : 0;
+    return `M${s.x.toFixed(1)} ${s.y.toFixed(1)} A${R} ${R} 0 ${large} 1 ${e.x.toFixed(1)} ${e.y.toFixed(1)}`;
+  }
+
+  _angleToTemp(deg) {
+    const cfg = this._config;
+    let ratio;
+    if      (deg >= 135) ratio = (deg - 135) / SPAN;
+    else if (deg <= 45)  ratio = (deg + 225) / SPAN;
+    else                 ratio = deg < 90 ? 1 : 0;
+    ratio = Math.max(0, Math.min(1, ratio));
+    return Math.round(cfg.min_temp + ratio * (cfg.max_temp - cfg.min_temp));
+  }
+
+  /* ── Drag үед зөвхөн arc/knob/text шинэчлэх (full re-render хийхгүй) ── */
+  _updateDial(temp) {
+    const sr  = this.shadowRoot;
+    const cfg = this._config;
+    const isOn   = this._num(cfg.sensors.power) === 1;
+    const mode   = this._num(cfg.sensors.mode);
+    const mColor = isOn
+      ? (MODES[String(Math.round(mode ?? 0))] ?? MODES['0']).color
+      : '#9E9E9E';
+
+    const ratio = Math.max(0, Math.min(1,
+      (temp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
+    const endA = A0 + ratio * SPAN;
+
+    const arcEl  = sr.getElementById('arc-act');
+    const knobEl = sr.getElementById('arc-knob');
+    const txtEl  = sr.getElementById('temp-txt');
+
+    if (arcEl) {
+      if (ratio > 0.005) {
+        arcEl.setAttribute('d', this._arc(A0, endA));
+        arcEl.setAttribute('stroke', mColor);
+        arcEl.style.display = '';
+      } else {
+        arcEl.style.display = 'none';
+      }
+    }
+    if (knobEl) {
+      const kp = this._pt(endA);
+      knobEl.setAttribute('cx', kp.x.toFixed(1));
+      knobEl.setAttribute('cy', kp.y.toFixed(1));
+    }
+    if (txtEl) txtEl.textContent = String(temp);
+  }
+
+  /* ── Үйлдлүүд ── */
   _doPower(isOn) { this._write(0, isOn ? 0 : 1); }
 
   _doMode(m) {
@@ -188,26 +212,33 @@ class FcuClimateCard extends HTMLElement {
     this._write(1, m);
   }
 
-  _doFan(speed) {
+  _doFan(level) {
     if (this._num(this._config.sensors.power) !== 1) this._write(0, 1);
-    this._write(2, speed);
+    this._write(2, level);
   }
 
-  _doTemp(delta) {
-    const cfg  = this._config;
-    const cur  = this._pending ?? this._num(cfg.sensors.set_temp) ?? cfg.min_temp;
-    const next = Math.max(cfg.min_temp, Math.min(cfg.max_temp, cur + delta));
-    this._pending = next;
-    this._write(4, next);
-    clearTimeout(this._pTimer);
-    this._pTimer = setTimeout(() => { this._pending = null; this._render(); }, 4000);
-    this._render();
+  _onDragMove(e, rect) {
+    const sx  = ((e.clientX - rect.left) / rect.width)  * VW;
+    const sy  = ((e.clientY - rect.top)  / rect.height) * VH;
+    let ang = Math.atan2(sy - CY, sx - CX) * 180 / Math.PI;
+    if (ang < 0) ang += 360;
+
+    const temp = this._angleToTemp(ang);
+    if (temp !== this._pending) {
+      this._pending = temp;
+      this._write(4, temp);
+      clearTimeout(this._pTimer);
+      this._pTimer = setTimeout(() => {
+        this._pending = null;
+        this._render();
+      }, 60000);
+    }
+    this._updateDial(temp);
   }
 
-  /* ── Render ──────────────────────────────────────────────── */
+  /* ── Render ── */
   _render() {
     if (!this._config || !this._hass) return;
-
     const cfg = this._config;
     const sns = cfg.sensors;
 
@@ -216,125 +247,185 @@ class FcuClimateCard extends HTMLElement {
     const setTemp  = this._pending ?? this._num(sns.set_temp);
     const ambTemp  = this._num(sns.ambient_temp);
     const fanSpeed = this._num(sns.fan_speed);
-    const fault    = sns.fault ? this._num(sns.fault) : null;
 
-    const isOn   = power === 1;
-    const mKey   = String(Math.round(mode ?? 0));
-    const mInfo  = MODES[mKey] ?? MODES['0'];
+    const isOn  = power === 1;
+    const mKey  = String(Math.round(mode ?? 0));
+    const mInfo = MODES[mKey] ?? MODES['0'];
     const mColor = isOn ? mInfo.color : '#9E9E9E';
-    const hasErr = fault !== null && fault > 0;
 
-    /* Fan speed индекс */
-    const fanRaw = fanSpeed !== null ? Math.round(fanSpeed) : null;
-    const fanIdx = fanRaw !== null ? FAN_VALS.indexOf(fanRaw) : -1;
+    /* Fan: 1–5 шат */
+    const fanLvl = fanSpeed !== null
+      ? Math.max(1, Math.min(5, Math.round(fanSpeed)))
+      : 1;
+    const fanPct = ((fanLvl - 1) / 4) * 100;
+    const fanBg  = `linear-gradient(to right, ${mColor} ${fanPct}%, var(--secondary-background-color, #e8e8e8) ${fanPct}%)`;
 
-    /* ── SVG ── */
-    const cx = 150, cy = 158, r = 112, W = 26;
-    const A0 = 135, SPAN = 270;
-    const bgArc = this._arc(cx, cy, r, A0, A0 + SPAN);
+    /* Arc */
+    const bgArc = this._arc(A0, A0 + SPAN);
+    let actArc = null;
+    let kp = this._pt(A0);
 
-    let actArc = '', kx = cx, ky = cy + r;
-    if (isOn && setTemp !== null) {
-      const ratio = Math.max(0, Math.min(1, (setTemp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
-      const endA  = A0 + ratio * SPAN;
-      if (ratio > 0.005) actArc = this._arc(cx, cy, r, A0, endA);
-      const kp = this._pt(cx, cy, r, endA);
-      kx = kp.x; ky = kp.y;
+    if (setTemp !== null) {
+      const ratio = Math.max(0, Math.min(1,
+        (setTemp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
+      const endA = A0 + ratio * SPAN;
+      if (ratio > 0.005) actArc = this._arc(A0, endA);
+      kp = this._pt(endA);
     }
 
     const setTxt = setTemp !== null ? `${setTemp}` : '--';
-    const ambTxt = ambTemp !== null ? `${ambTemp.toFixed(1)}` : '--';
+    const ambTxt = ambTemp !== null ? ambTemp.toFixed(1) : '--';
 
-    /* ── Fan speed товчлуурууд ── */
-    const fanBtns = FAN_VALS.map((v, i) => {
-      const active = i === fanIdx;
-      /* Дотоод цэгүүд: i+1 тооны цэг харуулна */
-      const dots = FAN_VALS.map((_, di) =>
-        `<span class="fan-dot-sm${di <= i ? ' filled' : ''}"
-          style="${di <= i && active ? `background:${mColor}` : ''}"></span>`
-      ).join('');
-      return `
-        <button class="fan-btn${active ? ' f-active' : ''}"
-          data-spd="${v}"
-          style="${active ? `color:${mColor}` : ''}">
-          ${dots}
-        </button>`;
-    }).join('');
-
-    /* ── Горим товчлуурын inline style ── */
-    const mBtnSt = (active, color) => active
-      ? `background:${color};color:#fff;--mdc-icon-size:22px`
-      : 'background:transparent;--mdc-icon-size:22px';
-    const pBtnSt = !isOn
-      ? `background:var(--secondary-background-color,#f5f5f5);color:var(--primary-text-color);--mdc-icon-size:22px`
-      : `background:transparent;--mdc-icon-size:22px`;
+    /* Mode button inline style */
+    const mBSt = (active, color) =>
+      `style="background:${active ? color : 'transparent'};` +
+      `color:${active ? '#fff' : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
+    const pBSt =
+      `style="background:${!isOn ? 'var(--secondary-background-color,#f5f5f5)' : 'transparent'};` +
+      `color:${!isOn ? 'var(--primary-text-color)' : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
 
     this.shadowRoot.innerHTML = `
       <style>${STYLES}</style>
       <ha-card>
         <div class="header">
           <span class="title">${cfg.name ?? 'FCU'}</span>
-          ${hasErr ? `<span class="fault-chip">⚠ Алдаа</span>` : ''}
         </div>
 
         <div class="body">
-          <!-- Термостат дугуй -->
-          <svg class="dial" viewBox="0 0 300 316">
+          <!-- ── Arc термостат ── -->
+          <svg class="dial" id="d-svg" viewBox="0 0 ${VW} ${VH}">
             <defs>
-              <filter id="kshadow" x="-40%" y="-40%" width="180%" height="180%">
+              <filter id="ksh" x="-50%" y="-50%" width="200%" height="200%">
                 <feDropShadow dx="0" dy="1" stdDeviation="2.5" flood-opacity="0.22"/>
               </filter>
             </defs>
-            <path d="${bgArc}" fill="none" stroke="#EBEBEB" stroke-width="${W}" stroke-linecap="round"/>
-            ${actArc ? `<path d="${actArc}" fill="none" stroke="${mColor}" stroke-width="${W}" stroke-linecap="round" opacity="0.95"/>` : ''}
-            ${isOn ? `<circle cx="${kx.toFixed(1)}" cy="${ky.toFixed(1)}" r="15"
-              fill="white" stroke="${mColor}" stroke-width="3.5" filter="url(#kshadow)"/>` : ''}
-            <text x="150" y="106" text-anchor="middle" class="dial-mode" fill="${mColor}">
+
+            <!-- Background arc -->
+            <path d="${bgArc}" fill="none"
+              stroke="#EBEBEB" stroke-width="${W}" stroke-linecap="round"/>
+
+            <!-- Active arc -->
+            ${actArc
+              ? `<path id="arc-act" d="${actArc}" fill="none"
+                   stroke="${mColor}" stroke-width="${W}" stroke-linecap="round"
+                   opacity="${isOn ? 0.95 : 0.3}"/>`
+              : `<path id="arc-act" d="${bgArc}" fill="none"
+                   stroke="${mColor}" stroke-width="${W}" stroke-linecap="round"
+                   opacity="0" style="display:none"/>`
+            }
+
+            <!-- Knob -->
+            <circle id="arc-knob"
+              cx="${kp.x.toFixed(1)}" cy="${kp.y.toFixed(1)}" r="17"
+              fill="white" stroke="${mColor}" stroke-width="3.5"
+              opacity="${isOn ? 1 : 0.4}"
+              filter="url(#ksh)"
+              style="cursor:grab;touch-action:none"/>
+
+            <!-- Горим нэр -->
+            <text x="150" y="108" text-anchor="middle"
+              class="dial-mode" fill="${mColor}">
               ${isOn ? mInfo.label : 'Off'}
             </text>
-            <text x="140" y="182" text-anchor="end" class="dial-temp">${setTxt}</text>
-            <text x="145" y="163" text-anchor="start" class="dial-unit">°C</text>
-            <text x="150" y="214" text-anchor="middle" class="dial-amb">🌡 ${ambTxt} °C</text>
+
+            <!-- Тохируулга температур (голлосон) -->
+            <text y="200" text-anchor="middle" x="150">
+              <tspan id="temp-txt" class="dial-temp">${setTxt}</tspan><tspan
+                class="dial-unit" dy="-22">°C</tspan>
+            </text>
+
+            <!-- Орчны температур -->
+            <text x="150" y="232" text-anchor="middle" class="dial-amb">
+              🌡 ${ambTxt} °C
+            </text>
           </svg>
 
-          <!-- Температур +/- -->
-          <div class="controls">
-            <button class="ctrl-btn" id="b-minus" ${!isOn ? 'disabled' : ''}>−</button>
-            <button class="ctrl-btn" id="b-plus"  ${!isOn ? 'disabled' : ''}>+</button>
+          <!-- ── Fan slider ── -->
+          <div class="fan-section" style="--fan-clr:${mColor}">
+            <div class="fan-lbl-row">
+              <span>Сэнсний хурд</span>
+              <span class="fan-speed-val" id="fan-lbl">Шат ${fanLvl}</span>
+            </div>
+            <input type="range" class="fan-slider" id="fan-sl"
+              min="1" max="5" step="1" value="${fanLvl}"
+              ${!isOn ? 'disabled' : ''}
+              style="background:${fanBg}">
+            <div class="fan-marks">
+              <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span>
+            </div>
           </div>
 
-          <!-- Fan speed -->
-          <div class="fan-row">${fanBtns}</div>
-
-          <!-- Горим товчлуурууд -->
+          <!-- ── Горим товчлуурууд ── -->
           <div class="mode-row">
-            <button class="mode-btn" id="b-off"  style="${pBtnSt}">
+            <button class="mode-btn" id="b-off"  ${pBSt}>
               <ha-icon icon="mdi:power"></ha-icon>
             </button>
-            <button class="mode-btn" id="b-fan"  style="${mBtnSt(isOn && mKey==='2', MODES['2'].color)}">
+            <button class="mode-btn" id="b-fan"
+              ${mBSt(isOn && mKey === '2', MODES['2'].color)}>
               <ha-icon icon="mdi:fan"></ha-icon>
             </button>
-            <button class="mode-btn" id="b-cool" style="${mBtnSt(isOn && mKey==='0', MODES['0'].color)}">
+            <button class="mode-btn" id="b-cool"
+              ${mBSt(isOn && mKey === '0', MODES['0'].color)}>
               <ha-icon icon="mdi:snowflake"></ha-icon>
             </button>
-            <button class="mode-btn" id="b-heat" style="${mBtnSt(isOn && mKey==='1', MODES['1'].color)}">
+            <button class="mode-btn" id="b-heat"
+              ${mBSt(isOn && mKey === '1', MODES['1'].color)}>
               <ha-icon icon="mdi:fire"></ha-icon>
             </button>
           </div>
         </div>
       </ha-card>`;
 
-    /* ── Event listeners ── */
-    this.shadowRoot.getElementById('b-minus')?.addEventListener('click', () => this._doTemp(-1));
-    this.shadowRoot.getElementById('b-plus') ?.addEventListener('click', () => this._doTemp(+1));
-    this.shadowRoot.getElementById('b-off')  ?.addEventListener('click', () => this._doPower(isOn));
-    this.shadowRoot.getElementById('b-fan')  ?.addEventListener('click', () => this._doMode(2));
-    this.shadowRoot.getElementById('b-cool') ?.addEventListener('click', () => this._doMode(0));
-    this.shadowRoot.getElementById('b-heat') ?.addEventListener('click', () => this._doMode(1));
+    const sr = this.shadowRoot;
 
-    this.shadowRoot.querySelectorAll('.fan-btn').forEach(btn => {
-      btn.addEventListener('click', () => this._doFan(parseInt(btn.dataset.spd)));
-    });
+    /* ── Mode товч event ── */
+    sr.getElementById('b-off') ?.addEventListener('click', () => this._doPower(isOn));
+    sr.getElementById('b-fan') ?.addEventListener('click', () => this._doMode(2));
+    sr.getElementById('b-cool')?.addEventListener('click', () => this._doMode(0));
+    sr.getElementById('b-heat')?.addEventListener('click', () => this._doMode(1));
+
+    /* ── Fan slider event ── */
+    const fanSl = sr.getElementById('fan-sl');
+    if (fanSl) {
+      fanSl.addEventListener('input', e => {
+        const v   = parseInt(e.target.value);
+        const pct = ((v - 1) / 4) * 100;
+        e.target.style.background =
+          `linear-gradient(to right, ${mColor} ${pct}%, var(--secondary-background-color, #e8e8e8) ${pct}%)`;
+        const lbl = sr.getElementById('fan-lbl');
+        if (lbl) lbl.textContent = `Шат ${v}`;
+      });
+      fanSl.addEventListener('change', e => {
+        this._doFan(parseInt(e.target.value));
+      });
+    }
+
+    /* ── Arc drag event ── */
+    const svg = sr.getElementById('d-svg');
+    if (svg) {
+      svg.addEventListener('pointerdown', e => {
+        const rect = svg.getBoundingClientRect();
+        const sx = ((e.clientX - rect.left) / rect.width)  * VW;
+        const sy = ((e.clientY - rect.top)  / rect.height) * VH;
+        const dx = sx - CX, dy = sy - CY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        /* Arc ring ойролцоо (±36px) дарсан үед л идэвхжинэ */
+        if (Math.abs(dist - R) > 36) return;
+        e.preventDefault();
+        this._dragging = true;
+        svg.setPointerCapture(e.pointerId);
+        this._onDragMove(e, rect);
+      });
+
+      svg.addEventListener('pointermove', e => {
+        if (!this._dragging) return;
+        e.preventDefault();
+        this._onDragMove(e, svg.getBoundingClientRect());
+      });
+
+      svg.addEventListener('pointerup',     () => { this._dragging = false; });
+      svg.addEventListener('pointercancel', () => { this._dragging = false; });
+    }
   }
 
   getCardSize() { return 5; }
@@ -352,7 +443,6 @@ class FcuClimateCard extends HTMLElement {
         set_temp:     'sensor.fcu_1_set_temperature',
         ambient_temp: 'sensor.fcu_1_ambient_temperature',
         fan_speed:    'sensor.fcu_1_fan_speed',
-        fault:        'sensor.fcu_1_fault_status',
       },
     };
   }
@@ -363,11 +453,11 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'fcu-climate-card',
   name: 'FCU Climate Card',
-  description: 'RS485 Modbus FCU термостат — set temp · fan speed · mode удирдах',
+  description: 'RS485 Modbus FCU термостат — arc drag · fan slider · mode удирдах',
   preview: true,
 });
 console.info(
-  '%c FCU-CLIMATE-CARD %c v1.1.0 ',
+  '%c FCU-CLIMATE-CARD %c v1.2.0 ',
   'color:#fff;background:#1E88E5;font-weight:bold;padding:2px 4px;border-radius:4px 0 0 4px',
   'color:#1E88E5;background:#E3F2FD;font-weight:bold;padding:2px 4px;border-radius:0 4px 4px 0'
 );
