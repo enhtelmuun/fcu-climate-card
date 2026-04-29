@@ -1,33 +1,21 @@
 /**
- * FCU Climate Card  v1.2.0
+ * FCU Climate Card  v1.3.0
  * ═══════════════════════════════════════════════════════════════
- * Шинэчлэлт v1.2.0:
- *   - Arc слайдер (touch/mouse drag) — set temp тохируулна
- *   - 60 секундын дараа sensor утга руу буцах
- *   - Fan speed → horizontal range slider (1–5 шат)
- *   - Алдааны chip болон +/− товч хасагдсан
- *   - Arc томорсон (r=120, W=28)
- *   - Температурын тоо голлосон
+ * Шинэчлэлт v1.3.0:
+ *   - Heat горим: arc ЗҮҮНЭЭС дүүрнэ (knob зүүн=min → баруун=max)
+ *   - Cool горим: arc БАРУУНААС дүүрнэ (knob баруун=min → зүүн=max)
+ *   - Fan горим:  arc ҮРГЭЛЖ ДҮҮРЭН цэнхэр (тохируулга харуулахгүй)
+ *   - Унтраасан үед: fan slider + arc drag идэвхгүй
+ *   - Горим солих → товч шууд тодорно (optimistic), дугуйн өнгө
+ *     sensor баталгаажсаны дараа солигдоно
+ *   - Pending timeout: 3 минут (180 сек)
  * ═══════════════════════════════════════════════════════════════
- *
- * Dashboard YAML тохиргоо:
- *   type: custom:fcu-climate-card
- *   name: FCU 1
- *   hub: modbus_gateway
- *   slave: 2
- *   min_temp: 16
- *   max_temp: 30
- *   sensors:
- *     power:        sensor.fcu_1_power_state
- *     mode:         sensor.fcu_1_mode
- *     set_temp:     sensor.fcu_1_set_temperature
- *     ambient_temp: sensor.fcu_1_ambient_temperature
- *     fan_speed:    sensor.fcu_1_fan_speed
  */
 
 /* ── Arc тогтмол ── */
 const CX = 150, CY = 148, R = 120, W = 28;
-const A0 = 135, SPAN = 270;
+const A0 = 135, SPAN = 270;        // 135° → 405° (= 45°) clockwise
+const AE = A0 + SPAN;              // 405° — arc-ийн баруун төгсгөл
 const VW = 300, VH = 290;
 
 const MODES = {
@@ -40,11 +28,9 @@ const STYLES = `
 :host { display: block; }
 ha-card { overflow: hidden; font-family: var(--primary-font-family, sans-serif); }
 
-/* ── Header ── */
 .header { padding: 16px 16px 0; }
 .title { font-size: 16px; font-weight: 500; color: var(--primary-text-color); }
 
-/* ── Body ── */
 .body { display: flex; flex-direction: column; align-items: center; padding: 0 12px 0; }
 
 /* ── Arc SVG ── */
@@ -64,20 +50,17 @@ ha-card { overflow: hidden; font-family: var(--primary-font-family, sans-serif);
   font-size: 12px; color: var(--secondary-text-color); margin-bottom: 8px;
 }
 .fan-speed-val { font-weight: 600; color: var(--primary-text-color); }
-
 .fan-slider {
   -webkit-appearance: none; appearance: none;
   width: 100%; height: 6px; border-radius: 99px;
   outline: none; cursor: pointer; margin: 0; display: block;
-  transition: background 0.1s;
 }
 .fan-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 26px; height: 26px; border-radius: 50%;
   background: var(--fan-clr, #1E88E5);
   box-shadow: 0 1px 6px rgba(0,0,0,0.28);
-  cursor: grab;
-  transition: transform 0.1s;
+  cursor: grab; transition: transform 0.1s;
 }
 .fan-slider::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.12); }
 .fan-slider::-moz-range-thumb {
@@ -112,17 +95,18 @@ class FcuClimateCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this._config   = null;
-    this._hass     = null;
-    this._pending  = null;   // drag-аар оновчтой set_temp
-    this._pTimer   = null;
-    this._dragging = false;
+    this._config      = null;
+    this._hass        = null;
+    this._pending     = null;    // optimistic set_temp
+    this._pTimer      = null;
+    this._pendingMode = null;    // optimistic mode (товч)
+    this._mTimer      = null;
+    this._dragging    = false;
   }
 
-  /* ── Config ── */
   setConfig(cfg) {
-    if (!cfg.hub)     throw new Error("'hub' шаардлагатай (modbus hub нэр)");
-    if (!cfg.slave)   throw new Error("'slave' шаардлагатай (RS485 slave ID)");
+    if (!cfg.hub)     throw new Error("'hub' шаардлагатай");
+    if (!cfg.slave)   throw new Error("'slave' шаардлагатай");
     if (!cfg.sensors) throw new Error("'sensors' шаардлагатай");
     this._config = { min_temp: 16, max_temp: 30, ...cfg };
     this._render();
@@ -159,37 +143,69 @@ class FcuClimateCard extends HTMLElement {
     return `M${s.x.toFixed(1)} ${s.y.toFixed(1)} A${R} ${R} 0 ${large} 1 ${e.x.toFixed(1)} ${e.y.toFixed(1)}`;
   }
 
-  _angleToTemp(deg) {
+  /* ── Горимоор knob байрлал + arc зам тооцоо ── */
+  _arcForTemp(setTemp, mKey) {
+    const cfg = this._config;
+    const ratio = Math.max(0, Math.min(1,
+      (setTemp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
+
+    if (mKey === '2') {
+      // Fan: үргэлж дүүрэн
+      return { arcPath: this._arc(A0, AE), knobAngle: A0, ratio: 1 };
+    }
+    if (mKey === '0') {
+      // Cool: БАРУУНААС (AE=405°) → зүүн тийш
+      const knobAngle = AE - ratio * SPAN;   // ratio=0→AE(баруун), ratio=1→A0(зүүн)
+      const arcPath = ratio > 0.005 ? this._arc(knobAngle, AE) : null;
+      return { arcPath, knobAngle, ratio };
+    }
+    // Heat / default: ЗҮҮНЭЭС (A0=135°) → баруун тийш
+    const knobAngle = A0 + ratio * SPAN;
+    const arcPath = ratio > 0.005 ? this._arc(A0, knobAngle) : null;
+    return { arcPath, knobAngle, ratio };
+  }
+
+  /* ── Хулганы өнцгөөс температур → горимоор чиглэл тооцно ── */
+  _angleToTemp(deg, mKey) {
     const cfg = this._config;
     let ratio;
-    if      (deg >= 135) ratio = (deg - 135) / SPAN;
-    else if (deg <= 45)  ratio = (deg + 225) / SPAN;
-    else                 ratio = deg < 90 ? 1 : 0;
+
+    if (mKey === '0') {
+      // Cool: баруун=min, зүүн=max
+      if (deg >= 135)     ratio = (AE - deg) / SPAN;   // AE=405
+      else if (deg <= 45) ratio = 0;                    // баруун захад ойр = min
+      else                ratio = deg > 90 ? 1 : 0;    // 45°–135° хөрс: зүүн=max
+    } else {
+      // Heat/Fan: зүүн=min, баруун=max
+      if (deg >= 135)     ratio = (deg - A0) / SPAN;
+      else if (deg <= 45) ratio = (deg + 225) / SPAN;
+      else                ratio = deg < 90 ? 1 : 0;    // 45°–135° хөрс: баруун=max
+    }
+
     ratio = Math.max(0, Math.min(1, ratio));
     return Math.round(cfg.min_temp + ratio * (cfg.max_temp - cfg.min_temp));
   }
 
-  /* ── Drag үед зөвхөн arc/knob/text шинэчлэх (full re-render хийхгүй) ── */
+  /* ── Drag үед DOM шинэчлэх (full re-render биш) ── */
   _updateDial(temp) {
     const sr  = this.shadowRoot;
     const cfg = this._config;
-    const isOn   = this._num(cfg.sensors.power) === 1;
     const mode   = this._num(cfg.sensors.mode);
-    const mColor = isOn
-      ? (MODES[String(Math.round(mode ?? 0))] ?? MODES['0']).color
-      : '#9E9E9E';
+    const mKey   = String(Math.round(mode ?? 1));
+    const isOn   = this._num(cfg.sensors.power) === 1;
+    const mColor = isOn ? (MODES[mKey] ?? MODES['1']).color : '#9E9E9E';
 
-    const ratio = Math.max(0, Math.min(1,
-      (temp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
-    const endA = A0 + ratio * SPAN;
+    if (mKey === '2') return; // Fan: дугуй хэзээ ч хөдлөхгүй
+
+    const { arcPath, knobAngle } = this._arcForTemp(temp, mKey);
 
     const arcEl  = sr.getElementById('arc-act');
     const knobEl = sr.getElementById('arc-knob');
     const txtEl  = sr.getElementById('temp-txt');
 
     if (arcEl) {
-      if (ratio > 0.005) {
-        arcEl.setAttribute('d', this._arc(A0, endA));
+      if (arcPath) {
+        arcEl.setAttribute('d', arcPath);
         arcEl.setAttribute('stroke', mColor);
         arcEl.style.display = '';
       } else {
@@ -197,7 +213,7 @@ class FcuClimateCard extends HTMLElement {
       }
     }
     if (knobEl) {
-      const kp = this._pt(endA);
+      const kp = this._pt(knobAngle);
       knobEl.setAttribute('cx', kp.x.toFixed(1));
       knobEl.setAttribute('cy', kp.y.toFixed(1));
     }
@@ -205,11 +221,22 @@ class FcuClimateCard extends HTMLElement {
   }
 
   /* ── Үйлдлүүд ── */
-  _doPower(isOn) { this._write(0, isOn ? 0 : 1); }
+  _doPower(isOn) {
+    this._write(0, isOn ? 0 : 1);
+    if (isOn) { // унтраах үед pending mode цэвэрлэнэ
+      clearTimeout(this._mTimer);
+      this._pendingMode = null;
+    }
+  }
 
   _doMode(m) {
     if (this._num(this._config.sensors.power) !== 1) this._write(0, 1);
     this._write(1, m);
+    // Товч шууд тодорно; дугуйн өнгө sensor баталгаажсаны дараа солигдоно
+    this._pendingMode = m;
+    clearTimeout(this._mTimer);
+    this._mTimer = setTimeout(() => { this._pendingMode = null; this._render(); }, 180000);
+    this._render();
   }
 
   _doFan(level) {
@@ -218,20 +245,19 @@ class FcuClimateCard extends HTMLElement {
   }
 
   _onDragMove(e, rect) {
-    const sx  = ((e.clientX - rect.left) / rect.width)  * VW;
-    const sy  = ((e.clientY - rect.top)  / rect.height) * VH;
+    const sx = ((e.clientX - rect.left) / rect.width)  * VW;
+    const sy = ((e.clientY - rect.top)  / rect.height) * VH;
     let ang = Math.atan2(sy - CY, sx - CX) * 180 / Math.PI;
     if (ang < 0) ang += 360;
 
-    const temp = this._angleToTemp(ang);
+    const mKey = String(Math.round(this._num(this._config.sensors.mode) ?? 1));
+    const temp = this._angleToTemp(ang, mKey);
+
     if (temp !== this._pending) {
       this._pending = temp;
       this._write(4, temp);
       clearTimeout(this._pTimer);
-      this._pTimer = setTimeout(() => {
-        this._pending = null;
-        this._render();
-      }, 60000);
+      this._pTimer = setTimeout(() => { this._pending = null; this._render(); }, 180000);
     }
     this._updateDial(temp);
   }
@@ -248,41 +274,51 @@ class FcuClimateCard extends HTMLElement {
     const ambTemp  = this._num(sns.ambient_temp);
     const fanSpeed = this._num(sns.fan_speed);
 
-    const isOn  = power === 1;
-    const mKey  = String(Math.round(mode ?? 0));
-    const mInfo = MODES[mKey] ?? MODES['0'];
+    const isOn = power === 1;
+
+    /* ── Sensor горим → дугуйн өнгө, чиглэл ── */
+    const mKey  = String(Math.round(mode ?? 1));
+    const mInfo = MODES[mKey] ?? MODES['1'];
     const mColor = isOn ? mInfo.color : '#9E9E9E';
 
-    /* Fan: 1–5 шат */
+    /* ── Optimistic горим → товч харуулах ── */
+    const dispKey = this._pendingMode !== null ? String(this._pendingMode) : mKey;
+
+    /* ── Fan: 1–5 шат ── */
     const fanLvl = fanSpeed !== null
       ? Math.max(1, Math.min(5, Math.round(fanSpeed)))
       : 1;
     const fanPct = ((fanLvl - 1) / 4) * 100;
     const fanBg  = `linear-gradient(to right, ${mColor} ${fanPct}%, var(--secondary-background-color, #e8e8e8) ${fanPct}%)`;
 
-    /* Arc */
-    const bgArc = this._arc(A0, A0 + SPAN);
-    let actArc = null;
-    let kp = this._pt(A0);
+    /* ── Arc тооцоолол (горимоор) ── */
+    const bgArc  = this._arc(A0, AE);
+    let arcResult = { arcPath: null, knobAngle: A0 };
 
     if (setTemp !== null) {
-      const ratio = Math.max(0, Math.min(1,
-        (setTemp - cfg.min_temp) / (cfg.max_temp - cfg.min_temp)));
-      const endA = A0 + ratio * SPAN;
-      if (ratio > 0.005) actArc = this._arc(A0, endA);
-      kp = this._pt(endA);
+      arcResult = this._arcForTemp(setTemp, mKey);
     }
+    const { arcPath, knobAngle } = arcResult;
+    const kp = this._pt(knobAngle);
 
     const setTxt = setTemp !== null ? `${setTemp}` : '--';
     const ambTxt = ambTemp !== null ? ambTemp.toFixed(1) : '--';
 
-    /* Mode button inline style */
-    const mBSt = (active, color) =>
-      `style="background:${active ? color : 'transparent'};` +
-      `color:${active ? '#fff' : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
-    const pBSt =
-      `style="background:${!isOn ? 'var(--secondary-background-color,#f5f5f5)' : 'transparent'};` +
-      `color:${!isOn ? 'var(--primary-text-color)' : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
+    /* ── Горим товч style ── */
+    const mBSt = (key, color) => {
+      const active = isOn && dispKey === key;
+      return `style="background:${active ? color : 'transparent'};` +
+        `color:${active ? '#fff' : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
+    };
+    const pBSt = `style="background:${!isOn
+      ? 'var(--secondary-background-color,#f5f5f5)'
+      : 'transparent'};color:${!isOn
+      ? 'var(--primary-text-color)'
+      : 'var(--secondary-text-color)'};--mdc-icon-size:22px"`;
+
+    /* Fan горим: knob нуух (arc үргэлж дүүрэн) */
+    const showKnob = isOn && mKey !== '2';
+    const arcOpacity = isOn ? 0.95 : 0.25;
 
     this.shadowRoot.innerHTML = `
       <style>${STYLES}</style>
@@ -300,35 +336,35 @@ class FcuClimateCard extends HTMLElement {
               </filter>
             </defs>
 
-            <!-- Background arc -->
+            <!-- Дэвсгэр arc -->
             <path d="${bgArc}" fill="none"
               stroke="#EBEBEB" stroke-width="${W}" stroke-linecap="round"/>
 
-            <!-- Active arc -->
-            ${actArc
-              ? `<path id="arc-act" d="${actArc}" fill="none"
+            <!-- Идэвхтэй arc (горимоор чиглэл, өнгө) -->
+            ${arcPath
+              ? `<path id="arc-act" d="${arcPath}" fill="none"
                    stroke="${mColor}" stroke-width="${W}" stroke-linecap="round"
-                   opacity="${isOn ? 0.95 : 0.3}"/>`
+                   opacity="${arcOpacity}"/>`
               : `<path id="arc-act" d="${bgArc}" fill="none"
                    stroke="${mColor}" stroke-width="${W}" stroke-linecap="round"
                    opacity="0" style="display:none"/>`
             }
 
-            <!-- Knob -->
+            <!-- Knob (fan горимд нуугдана) -->
             <circle id="arc-knob"
               cx="${kp.x.toFixed(1)}" cy="${kp.y.toFixed(1)}" r="17"
               fill="white" stroke="${mColor}" stroke-width="3.5"
-              opacity="${isOn ? 1 : 0.4}"
+              opacity="${showKnob ? 1 : 0}"
               filter="url(#ksh)"
-              style="cursor:grab;touch-action:none"/>
+              style="cursor:${isOn && mKey !== '2' ? 'grab' : 'default'};touch-action:none"/>
 
-            <!-- Горим нэр -->
+            <!-- Горим нэр (sensor-оос) -->
             <text x="150" y="108" text-anchor="middle"
               class="dial-mode" fill="${mColor}">
               ${isOn ? mInfo.label : 'Off'}
             </text>
 
-            <!-- Тохируулга температур (голлосон) -->
+            <!-- Тохируулга температур -->
             <text y="200" text-anchor="middle" x="150">
               <tspan id="temp-txt" class="dial-temp">${setTxt}</tspan><tspan
                 class="dial-unit" dy="-22">°C</tspan>
@@ -357,19 +393,19 @@ class FcuClimateCard extends HTMLElement {
 
           <!-- ── Горим товчлуурууд ── -->
           <div class="mode-row">
-            <button class="mode-btn" id="b-off"  ${pBSt}>
+            <button class="mode-btn" id="b-off" ${pBSt}>
               <ha-icon icon="mdi:power"></ha-icon>
             </button>
             <button class="mode-btn" id="b-fan"
-              ${mBSt(isOn && mKey === '2', MODES['2'].color)}>
+              ${mBSt('2', MODES['2'].color)}>
               <ha-icon icon="mdi:fan"></ha-icon>
             </button>
             <button class="mode-btn" id="b-cool"
-              ${mBSt(isOn && mKey === '0', MODES['0'].color)}>
+              ${mBSt('0', MODES['0'].color)}>
               <ha-icon icon="mdi:snowflake"></ha-icon>
             </button>
             <button class="mode-btn" id="b-heat"
-              ${mBSt(isOn && mKey === '1', MODES['1'].color)}>
+              ${mBSt('1', MODES['1'].color)}>
               <ha-icon icon="mdi:fire"></ha-icon>
             </button>
           </div>
@@ -378,13 +414,13 @@ class FcuClimateCard extends HTMLElement {
 
     const sr = this.shadowRoot;
 
-    /* ── Mode товч event ── */
+    /* ── Горим товч ── */
     sr.getElementById('b-off') ?.addEventListener('click', () => this._doPower(isOn));
     sr.getElementById('b-fan') ?.addEventListener('click', () => this._doMode(2));
     sr.getElementById('b-cool')?.addEventListener('click', () => this._doMode(0));
     sr.getElementById('b-heat')?.addEventListener('click', () => this._doMode(1));
 
-    /* ── Fan slider event ── */
+    /* ── Fan slider ── */
     const fanSl = sr.getElementById('fan-sl');
     if (fanSl) {
       fanSl.addEventListener('input', e => {
@@ -400,17 +436,16 @@ class FcuClimateCard extends HTMLElement {
       });
     }
 
-    /* ── Arc drag event ── */
+    /* ── Arc drag — зөвхөн исон үед, fan горим биш үед ── */
     const svg = sr.getElementById('d-svg');
-    if (svg) {
+    if (svg && isOn && mKey !== '2') {
       svg.addEventListener('pointerdown', e => {
         const rect = svg.getBoundingClientRect();
         const sx = ((e.clientX - rect.left) / rect.width)  * VW;
         const sy = ((e.clientY - rect.top)  / rect.height) * VH;
         const dx = sx - CX, dy = sy - CY;
         const dist = Math.sqrt(dx * dx + dy * dy);
-        /* Arc ring ойролцоо (±36px) дарсан үед л идэвхжинэ */
-        if (Math.abs(dist - R) > 36) return;
+        if (Math.abs(dist - R) > 36) return;   // arc ring-ийн ойролцоо дарсан үед
         e.preventDefault();
         this._dragging = true;
         svg.setPointerCapture(e.pointerId);
@@ -453,11 +488,11 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'fcu-climate-card',
   name: 'FCU Climate Card',
-  description: 'RS485 Modbus FCU термостат — arc drag · fan slider · mode удирдах',
+  description: 'RS485 Modbus FCU термостат — heat/cool/fan arc чиглэл · drag · fan slider',
   preview: true,
 });
 console.info(
-  '%c FCU-CLIMATE-CARD %c v1.2.0 ',
+  '%c FCU-CLIMATE-CARD %c v1.3.0 ',
   'color:#fff;background:#1E88E5;font-weight:bold;padding:2px 4px;border-radius:4px 0 0 4px',
   'color:#1E88E5;background:#E3F2FD;font-weight:bold;padding:2px 4px;border-radius:0 4px 4px 0'
 );
